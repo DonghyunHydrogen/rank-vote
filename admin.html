@@ -3,11 +3,79 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>방장 - 세션 만들기</title>
+  <title>방장 - 사람 추가(테스트)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    input, button { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
+    button { cursor: pointer; }
+    ul { padding-left: 18px; }
+    .small { color: #666; font-size: 12px; }
+  </style>
 </head>
 <body>
-  <h1>방장 페이지</h1>
-  <p>여기서 사람 목록 추가 + 세션 생성</p>
+  <h1>방장: 사람 추가 (Supabase 연결 테스트)</h1>
+
+  <div>
+    <input id="name" placeholder="이름 입력" />
+    <button id="add">추가</button>
+  </div>
+
+  <p id="msg" class="small"></p>
+
+  <h2>사람 목록</h2>
+  <ul id="list"></ul>
+
   <p><a href="./index.html">홈으로</a></p>
+
+  <!-- 1) Supabase 라이브러리 로드 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- 2) 내 프로젝트 URL/KEY 로드 -->
+  <script src="assets/config.js"></script>
+  <!-- 3) sb 클라이언트 생성 -->
+  <script src="assets/supabase.js"></script>
+
+  <script>
+    const nameEl = document.getElementById("name");
+    const msgEl = document.getElementById("msg");
+    const listEl = document.getElementById("list");
+
+    // 목록 불러오기
+    async function loadPeople() {
+      msgEl.textContent = "목록 불러오는 중...";
+      const { data, error } = await sb
+        .from("people")
+        .select("*")
+        .order("created_at", { ascending: true });
+
+      if (error) {
+        msgEl.textContent = "로드 실패: " + error.message;
+        return;
+      }
+
+      msgEl.textContent = `로드 완료: ${data.length}명`;
+      listEl.innerHTML = data.map(p => `<li>${p.name}</li>`).join("");
+    }
+
+    // 사람 추가
+    document.getElementById("add").addEventListener("click", async () => {
+      const name = nameEl.value.trim();
+      if (!name) return;
+
+      msgEl.textContent = "추가 중...";
+      const { error } = await sb.from("people").insert({ name });
+
+      if (error) {
+        msgEl.textContent = "추가 실패: " + error.message;
+        return;
+      }
+
+      nameEl.value = "";
+      msgEl.textContent = "추가 완료";
+      await loadPeople();
+    });
+
+    // 페이지 열리면 자동 로드
+    loadPeople();
+  </script>
 </body>
 </html>
