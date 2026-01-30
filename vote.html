@@ -8,6 +8,7 @@
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
     input, button, select { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
     button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: 0.6; }
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
     .card { border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; }
     .small { color:#666; font-size:12px; }
@@ -77,6 +78,46 @@
     function tokenKey(sessionId){ return `rankvote_token_${sessionId}`; }
     function getToken(sessionId){ return localStorage.getItem(tokenKey(sessionId)); }
     function setToken(sessionId, token){ localStorage.setItem(tokenKey(sessionId), token); }
+
+    // -------------------------
+    // 중복 투표 체크(세션 + 토큰 기준)
+    // -------------------------
+    async function checkAlreadyVoted(sessionId) {
+      const msg = document.getElementById("voteMsg");
+      const submitBtn = document.getElementById("submitVote");
+
+      const token = getToken(sessionId);
+      if (!token) {
+        // 토큰이 없으면 아직 투표 전으로 간주
+        submitBtn.disabled = false;
+        msg.textContent = "";
+        return false;
+      }
+
+      const { data, error } = await sb
+        .from("votes")
+        .select("id")
+        .eq("session_id", sessionId)
+        .eq("voter_hash", token)
+        .limit(1);
+
+      if (error) {
+        // 확인 실패 시에도 투표는 가능하게 둠 (단, 에러 메시지 표시)
+        msg.textContent = "투표 상태 확인 실패: " + error.message;
+        submitBtn.disabled = false;
+        return false;
+      }
+
+      const voted = (data && data.length > 0);
+      if (voted) {
+        msg.textContent = "이미 투표하셨습니다";
+        submitBtn.disabled = true;
+      } else {
+        msg.textContent = "";
+        submitBtn.disabled = false;
+      }
+      return voted;
+    }
 
     // -------------------------
     // 상태
@@ -182,6 +223,9 @@
       const t = getToken(session.id);
       document.getElementById("tokenMsg").textContent = t ? "익명 토큰: (저장됨)" : "익명 토큰: (없음)";
 
+      // ✅ 이미 투표했는지 확인 (있으면 버튼 비활성화 + 문구 표시)
+      await checkAlreadyVoted(session.id);
+
       document.getElementById("loadMsg").textContent = "로드 완료";
     }
 
@@ -200,7 +244,7 @@
     // -------------------------
     // 익명 토큰 생성/갱신
     // -------------------------
-    document.getElementById("makeAnonToken").addEventListener("click", () => {
+    document.getElementById("makeAnonToken").addEventListener("click", async () => {
       if (!session) {
         document.getElementById("tokenMsg").textContent = "세션을 먼저 불러오세요.";
         return;
@@ -208,6 +252,9 @@
       const token = crypto.randomUUID(); // 브라우저 내 생성
       setToken(session.id, token);
       document.getElementById("tokenMsg").textContent = "익명 토큰: (새로 저장됨)";
+
+      // 토큰을 새로 만들면 "이미 투표했는지" 상태가 바뀔 수 있어 재확인
+      await checkAlreadyVoted(session.id);
     });
 
     // -------------------------
@@ -218,6 +265,10 @@
       msg.textContent = "";
 
       if (!session) { msg.textContent = "세션을 먼저 불러오세요."; return; }
+
+      // 이미 투표한 상태면 즉시 차단
+      const already = await checkAlreadyVoted(session.id);
+      if (already) return;
 
       const meId = document.getElementById("meSelect").value;
       if (!meId) { msg.textContent = "‘나는 누구?’를 선택하세요."; return; }
@@ -261,12 +312,20 @@
       const { error } = await sb.from("votes").insert(payload);
 
       if (error) {
-        // 흔한 케이스: 중복 투표
+        // ✅ 중복 투표(유니크 제약)면 동일 문구로 처리
+        const em = (error.message || "").toLowerCase();
+        if (em.includes("duplicate") || em.includes("unique")) {
+          msg.textContent = "이미 투표하셨습니다";
+          document.getElementById("submitVote").disabled = true;
+          return;
+        }
         msg.textContent = "제출 실패: " + error.message;
         return;
       }
 
-      msg.textContent = "✅ 제출 완료 (익명)";
+      // ✅ 제출 성공 후: 재투표 금지 문구 + 버튼 비활성화
+      msg.textContent = "이미 투표하셨습니다";
+      document.getElementById("submitVote").disabled = true;
     });
   </script>
 </body>
