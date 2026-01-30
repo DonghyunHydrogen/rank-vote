@@ -4,10 +4,185 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>투표하기</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    input, button, select { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
+    button { cursor: pointer; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .card { border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; }
+    .small { color:#666; font-size:12px; }
+    ul.list { list-style:none; padding:0; margin:0; }
+    ul.list li { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border:1px solid #eee; border-radius:10px; margin:8px 0; background:#fafafa; }
+    .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:#eef2ff; }
+    a { word-break: break-all; }
+  </style>
 </head>
 <body>
-  <h1>투표 페이지</h1>
-  <p>여기서 본인 선택 후 등수 매기기</p>
+  <h1>투표하기</h1>
+
+  <!-- 세션 로드 -->
+  <div class="card">
+    <h2>1) 세션 불러오기</h2>
+    <div class="row">
+      <input id="sessionId" placeholder="session UUID" style="flex:1; min-width:260px;" />
+      <button id="loadSession">불러오기</button>
+      <span id="loadMsg" class="small"></span>
+    </div>
+    <p class="small">보통은 방장이 준 링크로 들어오면 자동으로 입력됩니다. (session=...)</p>
+  </div>
+
+  <!-- 투표 UI -->
+  <div id="voteCard" class="card" style="display:none;">
+    <h2 id="sessionTitle"></h2>
+    <p id="sessionMeta" class="small"></p>
+
+    <h3>2) 나는 누구?</h3>
+    <div class="row">
+      <select id="meSelect" style="min-width:220px;"></select>
+      <button id="makeAnonToken">익명 토큰 생성/갱신</button>
+      <span id="tokenMsg" class="small"></span>
+    </div>
+    <p class="small">
+      - 본인은 후보에서 자동 제외됩니다.<br/>
+      - 익명 토큰은 중복 투표 방지를 위한 값이며, 이름은 저장하지 않습니다.
+    </p>
+
+    <hr/>
+
+    <h3>3) 순위 정하기 (드래그로 정렬)</h3>
+    <ul id="rankList" class="list"></ul>
+
+    <div class="row">
+      <button id="submitVote">제출</button>
+      <span id="voteMsg" class="small"></span>
+    </div>
+  </div>
+
   <p><a href="./index.html">홈으로</a></p>
-</body>
-</html>
+
+  <!-- 라이브러리 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+  <script src="assets/config.js"></script>
+  <script src="assets/supabase.js"></script>
+
+  <script>
+    // -------------------------
+    // 유틸
+    // -------------------------
+    const qs = (k) => new URLSearchParams(location.search).get(k);
+    const esc = (s)=> (s??"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+
+    // 익명 토큰: 세션별로 1개 저장(로컬스토리지)
+    function tokenKey(sessionId){ return `rankvote_token_${sessionId}`; }
+    function getToken(sessionId){ return localStorage.getItem(tokenKey(sessionId)); }
+    function setToken(sessionId, token){ localStorage.setItem(tokenKey(sessionId), token); }
+
+    // -------------------------
+    // 상태
+    // -------------------------
+    let session = null;
+    let peopleMap = new Map();
+    let sortable = null;
+
+    // session 파라미터 자동 입력
+    const sp = qs("session");
+    if (sp) document.getElementById("sessionId").value = sp;
+
+    // -------------------------
+    // 렌더링
+    // -------------------------
+    async function fetchPeopleByIds(ids) {
+      const { data, error } = await sb
+        .from("people")
+        .select("id,name,is_active")
+        .in("id", ids);
+
+      if (error) throw error;
+
+      // 비활성 인원은 투표 후보에서 제외(세션에 들어있더라도)
+      const active = data.filter(p => p.is_active !== false);
+      peopleMap = new Map(active.map(p => [p.id, p]));
+    }
+
+    function renderMeSelect(candidateIds) {
+      const sel = document.getElementById("meSelect");
+      const opts = candidateIds
+        .filter(id => peopleMap.has(id))
+        .map(id => {
+          const p = peopleMap.get(id);
+          return `<option value="${p.id}">${esc(p.name)}</option>`;
+        });
+
+      sel.innerHTML = `<option value="">(선택)</option>` + opts.join("");
+    }
+
+    function renderRankList(candidateIds, meId) {
+      const list = document.getElementById("rankList");
+
+      // 본인은 제외
+      const filtered = candidateIds.filter(id => peopleMap.has(id) && id !== meId);
+
+      list.innerHTML = filtered.map((id, idx) => {
+        const p = peopleMap.get(id);
+        return `
+          <li data-id="${id}">
+            <span>${idx + 1}위 — ${esc(p.name)}</span>
+            <span class="badge">drag</span>
+          </li>
+        `;
+      }).join("");
+
+      if (sortable) sortable.destroy();
+      sortable = new Sortable(list, {
+        animation: 150,
+        onSort: () => {
+          // 순위번호 재표시
+          Array.from(list.querySelectorAll("li")).forEach((li, i) => {
+            const name = li.querySelector("span").textContent.split("—")[1].trim();
+            li.querySelector("span").textContent = `${i + 1}위 — ${name}`;
+          });
+        }
+      });
+    }
+
+    // -------------------------
+    // 세션 로드
+    // -------------------------
+    async function loadSession() {
+      const sessionId = document.getElementById("sessionId").value.trim();
+      if (!sessionId) return;
+
+      document.getElementById("loadMsg").textContent = "세션 로드 중...";
+
+      const { data, error } = await sb.from("sessions").select("*").eq("id", sessionId).single();
+      if (error) {
+        document.getElementById("loadMsg").textContent = "로드 실패: " + error.message;
+        return;
+      }
+      session = data;
+
+      // 후보 사람들 로드
+      try {
+        await fetchPeopleByIds(session.candidate_ids);
+      } catch (e) {
+        document.getElementById("loadMsg").textContent = "후보 로드 실패: " + (e.message ?? e);
+        return;
+      }
+
+      document.getElementById("voteCard").style.display = "block";
+      document.getElementById("sessionTitle").textContent = session.title;
+      document.getElementById("sessionMeta").textContent =
+        `후보 ${peopleMap.size}명 · 방식: ${session.top_k === 0 ? "전체 순위" : `Top-${session.top_k}`}`;
+
+      renderMeSelect(session.candidate_ids);
+      renderRankList(session.candidate_ids, "");
+
+      // 익명 토큰 상태 표시
+      const t = getToken(session.id);
+      document.getElementById("tokenMsg").textContent = t ? "익명 토큰: (저장됨)" : "익명 토큰: (없음)";
+
+      document.getElementById("loadMsg").textContent = "로드 완료";
+    }
+
+    do
