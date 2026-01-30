@@ -16,6 +16,9 @@
     th { background:#fafafa; }
     .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:#f3f4f6; }
     a { word-break: break-all; }
+    .grid { display:grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 960px) { .grid { grid-template-columns: 1fr 1fr; } }
+    canvas { max-width: 100%; }
   </style>
 </head>
 <body>
@@ -44,9 +47,26 @@
     </p>
   </div>
 
+  <!-- 차트 -->
+  <div id="charts" class="card" style="display:none;">
+    <h2>2) 시각화</h2>
+    <div class="grid">
+      <div class="card">
+        <h3 style="margin-top:0;">점수 막대 그래프 (Borda)</h3>
+        <canvas id="barScore"></canvas>
+        <p class="small">점수는 Borda 합계입니다. (1등=M-1점, 2등=M-2점 …)</p>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0;">1등 득표 비중 (파이)</h3>
+        <canvas id="pieFirst"></canvas>
+        <p class="small">각 후보가 “1등”으로 선택된 횟수 비율입니다.</p>
+      </div>
+    </div>
+  </div>
+
   <!-- 결과 표 -->
   <div id="resultCard" class="card" style="display:none;">
-    <h2>2) 집계 결과</h2>
+    <h2>3) 집계 결과</h2>
     <table>
       <thead>
         <tr>
@@ -54,6 +74,8 @@
           <th>이름</th>
           <th style="width:120px;">점수</th>
           <th style="width:160px;">투표에 등장(회)</th>
+          <th style="width:140px;">최고 등수</th>
+          <th style="width:140px;">최저 등수</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -68,139 +90,204 @@
   <script src="assets/config.js"></script>
   <script src="assets/supabase.js"></script>
 
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
   <script>
     const qs = (k) => new URLSearchParams(location.search).get(k);
     const esc = (s)=> (s??"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
 
-    // URL에 session 파라미터 있으면 자동 입력
     const sp = qs("session");
     if (sp) document.getElementById("sessionId").value = sp;
 
-    // 세션 + 후보 + 투표 불러오기
+    let barChart = null;
+    let pieChart = null;
+
+    function destroyCharts() {
+      if (barChart) { barChart.destroy(); barChart = null; }
+      if (pieChart) { pieChart.destroy(); pieChart = null; }
+    }
+
     async function loadResult() {
       const sessionId = document.getElementById("sessionId").value.trim();
       const msgEl = document.getElementById("msg");
       msgEl.textContent = "";
+      destroyCharts();
 
       if (!sessionId) return;
 
       msgEl.textContent = "불러오는 중...";
 
-      // 1) 세션 가져오기
+      // 1) 세션
       const { data: session, error: sErr } = await sb
         .from("sessions")
         .select("*")
         .eq("id", sessionId)
         .single();
 
-      if (sErr) {
-        msgEl.textContent = "세션 로드 실패: " + sErr.message;
-        return;
-      }
+      if (sErr) { msgEl.textContent = "세션 로드 실패: " + sErr.message; return; }
 
-      // 2) 후보 people 가져오기 (비활성은 제외)
       const candIds = session.candidate_ids || [];
+
+      // 2) 후보 people (비활성 제외)
       const { data: people, error: pErr } = await sb
         .from("people")
         .select("id,name,is_active")
         .in("id", candIds);
 
-      if (pErr) {
-        msgEl.textContent = "후보 로드 실패: " + pErr.message;
-        return;
-      }
+      if (pErr) { msgEl.textContent = "후보 로드 실패: " + pErr.message; return; }
 
       const activePeople = people.filter(p => p.is_active !== false);
       const peopleMap = new Map(activePeople.map(p => [p.id, p.name]));
-
-      // active 후보 리스트(세션에 들어있어도 비활성은 집계 제외)
       const activeCandidateIds = candIds.filter(id => peopleMap.has(id));
       const M = activeCandidateIds.length;
 
-      // 3) 투표 불러오기
+      // 3) votes: ranking만
       const { data: votes, error: vErr } = await sb
         .from("votes")
         .select("ranking")
         .eq("session_id", sessionId);
 
-      if (vErr) {
-        msgEl.textContent = "투표 로드 실패: " + vErr.message;
-        return;
-      }
+      if (vErr) { msgEl.textContent = "투표 로드 실패: " + vErr.message; return; }
 
-      // ---- 집계(Borda) ----
-      // scores[id] = 점수 합
-      // appeared[id] = 투표에 등장한 횟수 (ranking 배열에 포함된 횟수)
-      const scores = new Map(activeCandidateIds.map(id => [id, 0]));
-      const appeared = new Map(activeCandidateIds.map(id => [id, 0]));
-
-      // 세션 설정: top_k == 0이면 전체 순위, 아니면 Top-k
       const topK = session.top_k || 0;
 
+      // ---- 집계 ----
+      const scores = new Map(activeCandidateIds.map(id => [id, 0]));
+      const appeared = new Map(activeCandidateIds.map(id => [id, 0]));
+      const bestRank = new Map(activeCandidateIds.map(id => [id, Infinity])); // 최소
+      const worstRank = new Map(activeCandidateIds.map(id => [id, -Infinity])); // 최대
+      const firstCount = new Map(activeCandidateIds.map(id => [id, 0])); // 1등 횟수
+
       for (const v of votes) {
-        const r = Array.isArray(v.ranking) ? v.ranking : [];
+        const r0 = Array.isArray(v.ranking) ? v.ranking : [];
 
-        // ranking 안에서도 active 후보만 반영(삭제된 사람 제거)
-        const filtered = r.filter(id => activeCandidateIds.includes(id));
+        // active 후보만 반영
+        const filtered = r0.filter(id => activeCandidateIds.includes(id));
 
-        // 점수 부여 대상 배열
-        // - DB에 저장된 ranking 자체가 이미 top_k 반영돼 들어갔지만,
-        //   혹시 대비용으로 여기서도 top_k를 한 번 더 적용
+        // 점수/등수 집계 대상 (Top-k면 k명까지만)
         const effective = (topK > 0) ? filtered.slice(0, topK) : filtered;
 
-        // Borda 점수: 1등(M-1), 2등(M-2) ... (M등 0)
-        // Top-k에서는 effective 길이만큼만 점수 부여되고 나머지는 0점
+        // 등장/최고/최저 등수는 effective 기준으로만 계산 (Top-k 밖은 "미선정"으로 간주)
         for (let i = 0; i < effective.length; i++) {
           const id = effective[i];
-          // i=0 -> M-1, i=1 -> M-2 ...
+          const rank = i + 1;               // 1부터
           const pts = Math.max(M - 1 - i, 0);
+
           scores.set(id, (scores.get(id) || 0) + pts);
           appeared.set(id, (appeared.get(id) || 0) + 1);
+
+          if (rank < bestRank.get(id)) bestRank.set(id, rank);
+          if (rank > worstRank.get(id)) worstRank.set(id, rank);
+
+          if (i === 0) firstCount.set(id, (firstCount.get(id) || 0) + 1);
         }
       }
 
-      // 정렬: 점수 desc, 동점이면 appeared desc, 그래도 동점이면 이름 asc
+      // 정렬: 점수 desc, appeared desc, 이름 asc
       const rows = activeCandidateIds.map(id => ({
         id,
         name: peopleMap.get(id) || "(알 수 없음)",
         score: scores.get(id) || 0,
-        appeared: appeared.get(id) || 0
+        appeared: appeared.get(id) || 0,
+        best: bestRank.get(id),
+        worst: worstRank.get(id),
+        first: firstCount.get(id) || 0
       })).sort((a, b) => {
         if (b.score !== a.score) return b.score - a.score;
         if (b.appeared !== a.appeared) return b.appeared - a.appeared;
         return a.name.localeCompare(b.name, "ko");
       });
 
-      // ---- 렌더 ----
+      // ---- 렌더: 요약 ----
       document.getElementById("summary").style.display = "block";
       document.getElementById("resultCard").style.display = "block";
+      document.getElementById("charts").style.display = "block";
 
       document.getElementById("title").textContent = session.title;
       document.getElementById("meta").textContent =
         `후보 ${M}명 · 방식: ${topK === 0 ? "전체 순위" : `Top-${topK}`}`;
       document.getElementById("voteCount").textContent = `투표 ${votes.length}건`;
 
+      // ---- 렌더: 표 ----
       const tbody = document.getElementById("tbody");
-      tbody.innerHTML = rows.map((r, idx) => `
-        <tr>
-          <td>${idx + 1}</td>
-          <td>${esc(r.name)}</td>
-          <td>${r.score}</td>
-          <td>${r.appeared}</td>
-        </tr>
-      `).join("");
+      tbody.innerHTML = rows.map((r, idx) => {
+        const bestTxt = (r.best === Infinity) ? "-" : r.best;
+        const worstTxt = (r.worst === -Infinity) ? "-" : r.worst;
+        return `
+          <tr>
+            <td>${idx + 1}</td>
+            <td>${esc(r.name)}</td>
+            <td>${r.score}</td>
+            <td>${r.appeared}</td>
+            <td>${bestTxt}</td>
+            <td>${worstTxt}</td>
+          </tr>
+        `;
+      }).join("");
 
       document.getElementById("note").textContent =
         (votes.length === 0)
           ? "아직 투표가 없습니다. (투표 링크로 투표한 뒤 다시 확인하세요)"
-          : "집계 규칙: Borda Count (1등=M-1점, 2등=M-2점 …).";
+          : "집계 규칙: Borda Count. 최고/최저 등수는 (Top-k면) Top-k 내에서 집계됩니다.";
+
+      // ---- 차트 데이터 준비 ----
+      const labels = rows.map(r => r.name);
+      const scoreData = rows.map(r => r.score);
+
+      const firstTotal = rows.reduce((acc, r) => acc + r.first, 0);
+      // 파이는 firstTotal=0이면 의미 없음 → 투표 0이거나 모두 Top-k=0인데 첫 rank가 없을 수는 없지만 대비
+      const pieLabels = rows.filter(r => r.first > 0).map(r => r.name);
+      const pieData = rows.filter(r => r.first > 0).map(r => r.first);
+
+      // ---- 차트 그리기 ----
+      const barCtx = document.getElementById("barScore");
+      barChart = new Chart(barCtx, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [{ label: "Score (Borda)", data: scoreData }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { display: true },
+            tooltip: { enabled: true }
+          },
+          scales: {
+            y: { beginAtZero: true }
+          }
+        }
+      });
+
+      const pieCtx = document.getElementById("pieFirst");
+      if (firstTotal === 0) {
+        // 투표가 없으면 빈 차트 대신 안내
+        // (Chart.js로 빈 pie를 만들 수도 있지만, UX상 메시지가 더 명확)
+        pieCtx.parentElement.innerHTML = `
+          <h3 style="margin-top:0;">1등 득표 비중 (파이)</h3>
+          <p class="small">표시할 데이터가 없습니다. (아직 투표가 없거나 1등 집계가 불가)</p>
+        `;
+      } else {
+        pieChart = new Chart(pieCtx, {
+          type: "pie",
+          data: {
+            labels: pieLabels,
+            datasets: [{ label: "1st place votes", data: pieData }]
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: true }
+            }
+          }
+        });
+      }
 
       msgEl.textContent = "완료";
     }
 
     document.getElementById("load").addEventListener("click", loadResult);
-
-    // 링크로 들어오면 자동 로드
     if (sp) loadResult();
   </script>
 </body>
