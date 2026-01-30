@@ -11,15 +11,15 @@
     .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
     .small { color:#666; font-size:12px; }
     .card { border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; }
-    ul { padding-left: 18px; }
-    .people { list-style:none; padding:0; }
-    .people li { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border:1px solid #eee; border-radius:10px; margin:8px 0; }
+    .people { list-style:none; padding:0; margin:0; }
+    .people li { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border:1px solid #eee; border-radius:10px; margin:8px 0; gap:12px;}
     .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:#f3f4f6; }
+    .muted { opacity:0.5; }
     a { word-break: break-all; }
   </style>
 </head>
 <body>
-  <h1>방장: 사람 추가 + 세션 생성</h1>
+  <h1>방장: 사람 관리 + 세션 생성</h1>
 
   <!-- 사람 추가 -->
   <div class="card">
@@ -31,16 +31,23 @@
     </div>
   </div>
 
-  <!-- 후보 선택 -->
+  <!-- 사람 목록 + 삭제/복구 -->
   <div class="card">
-    <h2>2) 이번 투표 후보 선택</h2>
-    <p class="small">체크한 사람들만 이번 세션 후보가 됩니다. (최소 2명)</p>
+    <div class="row" style="justify-content:space-between;">
+      <h2 style="margin:0;">2) 사람 목록</h2>
+      <label class="small">
+        <input type="checkbox" id="showInactive" />
+        삭제된 사람도 보기
+      </label>
+    </div>
+    <p class="small">삭제는 “DB에서 제거”가 아니라 “비활성화(숨김)”입니다. (세션/투표 데이터 보호)</p>
     <ul id="peopleList" class="people"></ul>
   </div>
 
   <!-- 세션 생성 -->
   <div class="card">
     <h2>3) 세션 생성</h2>
+    <p class="small">아래 체크된 활성 인원만 후보로 들어갑니다. (최소 2명)</p>
     <div class="row">
       <input id="sessionTitle" placeholder="세션 제목 (예: 1/30 투표)" style="flex:1; min-width:220px;" />
       <select id="topK">
@@ -64,14 +71,20 @@
     const nameEl = document.getElementById("name");
     const msgEl = document.getElementById("msg");
     const peopleListEl = document.getElementById("peopleList");
+    const showInactiveEl = document.getElementById("showInactive");
+
+    function esc(s){ return (s ?? "").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
 
     async function loadPeople() {
       msgEl.textContent = "목록 불러오는 중...";
-      const { data, error } = await sb
-        .from("people")
-        .select("*")
-        .order("created_at", { ascending: true });
 
+      const showInactive = showInactiveEl.checked;
+
+      // is_active 컬럼이 없는 상태에서 에러가 날 수 있으니, 우선 select에 is_active 포함
+      let q = sb.from("people").select("id,name,created_at,is_active").order("created_at", { ascending: true });
+      if (!showInactive) q = q.eq("is_active", true);
+
+      const { data, error } = await q;
       if (error) {
         msgEl.textContent = "로드 실패: " + error.message;
         return;
@@ -79,15 +92,61 @@
 
       msgEl.textContent = `로드 완료: ${data.length}명`;
 
-      peopleListEl.innerHTML = data.map(p => `
-        <li>
-          <label style="display:flex; gap:10px; align-items:center; width:100%;">
-            <input type="checkbox" class="cand" value="${p.id}">
-            <span>${p.name}</span>
-          </label>
-          <span class="badge">${p.id.slice(0, 8)}</span>
-        </li>
-      `).join("");
+      peopleListEl.innerHTML = data.map(p => {
+        const active = (p.is_active !== false); // 기본 true 취급
+        return `
+          <li class="${active ? "" : "muted"}">
+            <label style="display:flex; gap:10px; align-items:center; width:100%;">
+              <input type="checkbox" class="cand" value="${p.id}" ${active ? "" : "disabled"}>
+              <span>${esc(p.name)} ${active ? "" : "(삭제됨)"}</span>
+            </label>
+
+            <div class="row" style="gap:8px;">
+              <span class="badge">${p.id.slice(0,8)}</span>
+              ${active
+                ? `<button class="del" data-id="${p.id}" data-name="${esc(p.name)}">삭제</button>`
+                : `<button class="restore" data-id="${p.id}" data-name="${esc(p.name)}">복구</button>`
+              }
+            </div>
+          </li>
+        `;
+      }).join("");
+
+      // 삭제 버튼 이벤트(비활성화)
+      document.querySelectorAll(".del").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-id");
+          const nm = btn.getAttribute("data-name");
+          if (!confirm(`'${nm}'을(를) 삭제(비활성화)하시겠습니까?`)) return;
+
+          msgEl.textContent = "삭제 처리 중...";
+          const { error } = await sb.from("people").update({ is_active: false }).eq("id", id);
+          if (error) {
+            msgEl.textContent = "삭제 실패: " + error.message;
+            return;
+          }
+          msgEl.textContent = "삭제 완료";
+          await loadPeople();
+        });
+      });
+
+      // 복구 버튼 이벤트(활성화)
+      document.querySelectorAll(".restore").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          const id = btn.getAttribute("data-id");
+          const nm = btn.getAttribute("data-name");
+          if (!confirm(`'${nm}'을(를) 복구(활성화)하시겠습니까?`)) return;
+
+          msgEl.textContent = "복구 처리 중...";
+          const { error } = await sb.from("people").update({ is_active: true }).eq("id", id);
+          if (error) {
+            msgEl.textContent = "복구 실패: " + error.message;
+            return;
+          }
+          msgEl.textContent = "복구 완료";
+          await loadPeople();
+        });
+      });
     }
 
     // 사람 추가
@@ -96,7 +155,7 @@
       if (!name) return;
 
       msgEl.textContent = "추가 중...";
-      const { error } = await sb.from("people").insert({ name });
+      const { error } = await sb.from("people").insert({ name, is_active: true });
 
       if (error) {
         msgEl.textContent = "추가 실패: " + error.message;
@@ -112,8 +171,9 @@
     document.getElementById("createSession").addEventListener("click", async () => {
       const title = document.getElementById("sessionTitle").value.trim() || "투표 세션";
       const topK = parseInt(document.getElementById("topK").value, 10);
+
       const candidateIds = Array.from(document.querySelectorAll(".cand"))
-        .filter(x => x.checked)
+        .filter(x => x.checked && !x.disabled)
         .map(x => x.value);
 
       const out = document.getElementById("sessionOut");
@@ -139,7 +199,6 @@
 
       const sessionId = data.id;
 
-      // 현재 사이트 경로에서 admin.html을 제거하여 base 경로 만들기
       const base = location.href.replace(/admin\.html(\?.*)?$/, "");
       const voteLink = `${base}vote.html?session=${sessionId}`;
       const resultLink = `${base}result.html?session=${sessionId}`;
@@ -152,6 +211,8 @@
         <p class="small">이 링크를 공유하면 됩니다.</p>
       `;
     });
+
+    showInactiveEl.addEventListener("change", loadPeople);
 
     loadPeople();
   </script>
