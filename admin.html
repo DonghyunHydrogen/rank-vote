@@ -3,43 +3,68 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>방장 - 사람 추가(테스트)</title>
+  <title>방장 - 사람/세션 관리</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    input, button { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
+    input, button, select { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
     button { cursor: pointer; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .small { color:#666; font-size:12px; }
+    .card { border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; }
     ul { padding-left: 18px; }
-    .small { color: #666; font-size: 12px; }
+    .people { list-style:none; padding:0; }
+    .people li { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border:1px solid #eee; border-radius:10px; margin:8px 0; }
+    .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:#f3f4f6; }
+    a { word-break: break-all; }
   </style>
 </head>
 <body>
-  <h1>방장: 사람 추가 (Supabase 연결 테스트)</h1>
+  <h1>방장: 사람 추가 + 세션 생성</h1>
 
-  <div>
-    <input id="name" placeholder="이름 입력" />
-    <button id="add">추가</button>
+  <!-- 사람 추가 -->
+  <div class="card">
+    <h2>1) 사람 추가</h2>
+    <div class="row">
+      <input id="name" placeholder="이름 입력" />
+      <button id="add">추가</button>
+      <span id="msg" class="small"></span>
+    </div>
   </div>
 
-  <p id="msg" class="small"></p>
+  <!-- 후보 선택 -->
+  <div class="card">
+    <h2>2) 이번 투표 후보 선택</h2>
+    <p class="small">체크한 사람들만 이번 세션 후보가 됩니다. (최소 2명)</p>
+    <ul id="peopleList" class="people"></ul>
+  </div>
 
-  <h2>사람 목록</h2>
-  <ul id="list"></ul>
+  <!-- 세션 생성 -->
+  <div class="card">
+    <h2>3) 세션 생성</h2>
+    <div class="row">
+      <input id="sessionTitle" placeholder="세션 제목 (예: 1/30 투표)" style="flex:1; min-width:220px;" />
+      <select id="topK">
+        <option value="0">전체 순위(1~N)</option>
+        <option value="3">Top-3만</option>
+        <option value="5">Top-5만</option>
+      </select>
+      <button id="createSession">세션 만들기</button>
+    </div>
+    <div id="sessionOut" class="card" style="display:none;"></div>
+  </div>
 
   <p><a href="./index.html">홈으로</a></p>
 
-  <!-- 1) Supabase 라이브러리 로드 -->
+  <!-- Supabase -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <!-- 2) 내 프로젝트 URL/KEY 로드 -->
   <script src="assets/config.js"></script>
-  <!-- 3) sb 클라이언트 생성 -->
   <script src="assets/supabase.js"></script>
 
   <script>
     const nameEl = document.getElementById("name");
     const msgEl = document.getElementById("msg");
-    const listEl = document.getElementById("list");
+    const peopleListEl = document.getElementById("peopleList");
 
-    // 목록 불러오기
     async function loadPeople() {
       msgEl.textContent = "목록 불러오는 중...";
       const { data, error } = await sb
@@ -53,7 +78,16 @@
       }
 
       msgEl.textContent = `로드 완료: ${data.length}명`;
-      listEl.innerHTML = data.map(p => `<li>${p.name}</li>`).join("");
+
+      peopleListEl.innerHTML = data.map(p => `
+        <li>
+          <label style="display:flex; gap:10px; align-items:center; width:100%;">
+            <input type="checkbox" class="cand" value="${p.id}">
+            <span>${p.name}</span>
+          </label>
+          <span class="badge">${p.id.slice(0, 8)}</span>
+        </li>
+      `).join("");
     }
 
     // 사람 추가
@@ -74,7 +108,51 @@
       await loadPeople();
     });
 
-    // 페이지 열리면 자동 로드
+    // 세션 생성
+    document.getElementById("createSession").addEventListener("click", async () => {
+      const title = document.getElementById("sessionTitle").value.trim() || "투표 세션";
+      const topK = parseInt(document.getElementById("topK").value, 10);
+      const candidateIds = Array.from(document.querySelectorAll(".cand"))
+        .filter(x => x.checked)
+        .map(x => x.value);
+
+      const out = document.getElementById("sessionOut");
+      out.style.display = "block";
+
+      if (candidateIds.length < 2) {
+        out.textContent = "후보를 최소 2명 이상 선택하세요.";
+        return;
+      }
+
+      out.textContent = "세션 생성 중...";
+
+      const { data, error } = await sb.from("sessions").insert({
+        title,
+        candidate_ids: candidateIds,
+        top_k: topK
+      }).select("*").single();
+
+      if (error) {
+        out.textContent = "세션 생성 실패: " + error.message;
+        return;
+      }
+
+      const sessionId = data.id;
+
+      // 현재 사이트 경로에서 admin.html을 제거하여 base 경로 만들기
+      const base = location.href.replace(/admin\.html(\?.*)?$/, "");
+      const voteLink = `${base}vote.html?session=${sessionId}`;
+      const resultLink = `${base}result.html?session=${sessionId}`;
+
+      out.innerHTML = `
+        <h3>✅ 세션 생성 완료</h3>
+        <p><b>Session ID:</b> ${sessionId}</p>
+        <p><b>투표 링크:</b> <a href="${voteLink}">${voteLink}</a></p>
+        <p><b>결과 링크:</b> <a href="${resultLink}">${resultLink}</a></p>
+        <p class="small">이 링크를 공유하면 됩니다.</p>
+      `;
+    });
+
     loadPeople();
   </script>
 </body>
