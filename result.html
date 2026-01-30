@@ -4,10 +4,204 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>결과</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    input, button { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; }
+    button { cursor: pointer; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .card { border:1px solid #eee; border-radius:12px; padding:16px; margin:12px 0; }
+    .small { color:#666; font-size:12px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 10px; text-align:left; }
+    th { background:#fafafa; }
+    .badge { font-size:12px; padding:4px 8px; border-radius:999px; background:#f3f4f6; }
+    a { word-break: break-all; }
+  </style>
 </head>
 <body>
-  <h1>결과 페이지</h1>
-  <p>여기서 투표 결과 집계 표시</p>
+  <h1>결과</h1>
+
+  <!-- 세션 로드 -->
+  <div class="card">
+    <h2>1) 세션 불러오기</h2>
+    <div class="row">
+      <input id="sessionId" placeholder="session UUID" style="flex:1; min-width:260px;" />
+      <button id="load">불러오기</button>
+      <span id="msg" class="small"></span>
+    </div>
+    <p class="small">방장이 준 링크(result.html?session=...)로 들어오면 자동 입력됩니다.</p>
+  </div>
+
+  <!-- 요약 -->
+  <div id="summary" class="card" style="display:none;">
+    <h2 id="title"></h2>
+    <div class="row">
+      <span class="badge" id="meta"></span>
+      <span class="badge" id="voteCount"></span>
+    </div>
+    <p class="small">
+      익명 집계만 표시합니다. (개별 투표자가 누구인지, 누가 누구에게 투표했는지는 공개하지 않음)
+    </p>
+  </div>
+
+  <!-- 결과 표 -->
+  <div id="resultCard" class="card" style="display:none;">
+    <h2>2) 집계 결과</h2>
+    <table>
+      <thead>
+        <tr>
+          <th style="width:80px;">순위</th>
+          <th>이름</th>
+          <th style="width:120px;">점수</th>
+          <th style="width:160px;">투표에 등장(회)</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <p class="small" id="note"></p>
+  </div>
+
   <p><a href="./index.html">홈으로</a></p>
+
+  <!-- Supabase -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="assets/config.js"></script>
+  <script src="assets/supabase.js"></script>
+
+  <script>
+    const qs = (k) => new URLSearchParams(location.search).get(k);
+    const esc = (s)=> (s??"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+
+    // URL에 session 파라미터 있으면 자동 입력
+    const sp = qs("session");
+    if (sp) document.getElementById("sessionId").value = sp;
+
+    // 세션 + 후보 + 투표 불러오기
+    async function loadResult() {
+      const sessionId = document.getElementById("sessionId").value.trim();
+      const msgEl = document.getElementById("msg");
+      msgEl.textContent = "";
+
+      if (!sessionId) return;
+
+      msgEl.textContent = "불러오는 중...";
+
+      // 1) 세션 가져오기
+      const { data: session, error: sErr } = await sb
+        .from("sessions")
+        .select("*")
+        .eq("id", sessionId)
+        .single();
+
+      if (sErr) {
+        msgEl.textContent = "세션 로드 실패: " + sErr.message;
+        return;
+      }
+
+      // 2) 후보 people 가져오기 (비활성은 제외)
+      const candIds = session.candidate_ids || [];
+      const { data: people, error: pErr } = await sb
+        .from("people")
+        .select("id,name,is_active")
+        .in("id", candIds);
+
+      if (pErr) {
+        msgEl.textContent = "후보 로드 실패: " + pErr.message;
+        return;
+      }
+
+      const activePeople = people.filter(p => p.is_active !== false);
+      const peopleMap = new Map(activePeople.map(p => [p.id, p.name]));
+
+      // active 후보 리스트(세션에 들어있어도 비활성은 집계 제외)
+      const activeCandidateIds = candIds.filter(id => peopleMap.has(id));
+      const M = activeCandidateIds.length;
+
+      // 3) 투표 불러오기
+      const { data: votes, error: vErr } = await sb
+        .from("votes")
+        .select("ranking")
+        .eq("session_id", sessionId);
+
+      if (vErr) {
+        msgEl.textContent = "투표 로드 실패: " + vErr.message;
+        return;
+      }
+
+      // ---- 집계(Borda) ----
+      // scores[id] = 점수 합
+      // appeared[id] = 투표에 등장한 횟수 (ranking 배열에 포함된 횟수)
+      const scores = new Map(activeCandidateIds.map(id => [id, 0]));
+      const appeared = new Map(activeCandidateIds.map(id => [id, 0]));
+
+      // 세션 설정: top_k == 0이면 전체 순위, 아니면 Top-k
+      const topK = session.top_k || 0;
+
+      for (const v of votes) {
+        const r = Array.isArray(v.ranking) ? v.ranking : [];
+
+        // ranking 안에서도 active 후보만 반영(삭제된 사람 제거)
+        const filtered = r.filter(id => activeCandidateIds.includes(id));
+
+        // 점수 부여 대상 배열
+        // - DB에 저장된 ranking 자체가 이미 top_k 반영돼 들어갔지만,
+        //   혹시 대비용으로 여기서도 top_k를 한 번 더 적용
+        const effective = (topK > 0) ? filtered.slice(0, topK) : filtered;
+
+        // Borda 점수: 1등(M-1), 2등(M-2) ... (M등 0)
+        // Top-k에서는 effective 길이만큼만 점수 부여되고 나머지는 0점
+        for (let i = 0; i < effective.length; i++) {
+          const id = effective[i];
+          // i=0 -> M-1, i=1 -> M-2 ...
+          const pts = Math.max(M - 1 - i, 0);
+          scores.set(id, (scores.get(id) || 0) + pts);
+          appeared.set(id, (appeared.get(id) || 0) + 1);
+        }
+      }
+
+      // 정렬: 점수 desc, 동점이면 appeared desc, 그래도 동점이면 이름 asc
+      const rows = activeCandidateIds.map(id => ({
+        id,
+        name: peopleMap.get(id) || "(알 수 없음)",
+        score: scores.get(id) || 0,
+        appeared: appeared.get(id) || 0
+      })).sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (b.appeared !== a.appeared) return b.appeared - a.appeared;
+        return a.name.localeCompare(b.name, "ko");
+      });
+
+      // ---- 렌더 ----
+      document.getElementById("summary").style.display = "block";
+      document.getElementById("resultCard").style.display = "block";
+
+      document.getElementById("title").textContent = session.title;
+      document.getElementById("meta").textContent =
+        `후보 ${M}명 · 방식: ${topK === 0 ? "전체 순위" : `Top-${topK}`}`;
+      document.getElementById("voteCount").textContent = `투표 ${votes.length}건`;
+
+      const tbody = document.getElementById("tbody");
+      tbody.innerHTML = rows.map((r, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td>${esc(r.name)}</td>
+          <td>${r.score}</td>
+          <td>${r.appeared}</td>
+        </tr>
+      `).join("");
+
+      document.getElementById("note").textContent =
+        (votes.length === 0)
+          ? "아직 투표가 없습니다. (투표 링크로 투표한 뒤 다시 확인하세요)"
+          : "집계 규칙: Borda Count (1등=M-1점, 2등=M-2점 …).";
+
+      msgEl.textContent = "완료";
+    }
+
+    document.getElementById("load").addEventListener("click", loadResult);
+
+    // 링크로 들어오면 자동 로드
+    if (sp) loadResult();
+  </script>
 </body>
 </html>
