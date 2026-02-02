@@ -73,6 +73,16 @@
     // -------------------------
     const qs = (k) => new URLSearchParams(location.search).get(k);
     const esc = (s)=> (s??"").toString().replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    // ✅ 결과 페이지 링크 HTML 생성
+    function resultLinkHTML(sessionId) {
+      const base = location.href.replace(/vote\.html(\?.*)?$/, "");
+      const url = `${base}result.html?session=${sessionId}`;
+      return `
+        이미 투표하셨습니다<br/>
+        <a href="${url}" target="_blank">👉 결과 페이지 보기</a>
+      `;
+    }
+
 
     // 익명 토큰: 세션별로 1개 저장(로컬스토리지)
     function tokenKey(sessionId){ return `rankvote_token_${sessionId}`; }
@@ -110,7 +120,7 @@
 
       const voted = (data && data.length > 0);
       if (voted) {
-        msg.textContent = "이미 투표하셨습니다";
+        msg.innerHTML = resultLinkHTML(sessionId);
         submitBtn.disabled = true;
       } else {
         msg.textContent = "";
@@ -315,7 +325,7 @@
         // ✅ 중복 투표(유니크 제약)면 동일 문구로 처리
         const em = (error.message || "").toLowerCase();
         if (em.includes("duplicate") || em.includes("unique")) {
-          msg.textContent = "이미 투표하셨습니다";
+          msg.textContent = resultLinkHTML(session.id);
           document.getElementById("submitVote").disabled = true;
           return;
         }
@@ -324,7 +334,7 @@
       }
 
       // ✅ 제출 성공 후: 재투표 금지 문구 + 버튼 비활성화
-      msg.textContent = "이미 투표하셨습니다";
+      msg.textContent = resultLinkHTML(session.id);
       document.getElementById("submitVote").disabled = true;
     });
   </script>
